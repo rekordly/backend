@@ -1,4 +1,46 @@
-    .delivery.count({
+const { prisma } = require('../../config/database');
+const { AppError, NotFoundError, ConflictError } = require('../../shared/errors/app-error');
+const { ORDER_STATUS, DISPUTE_STATUS, USER_ROLES, DRIVER_STATUS, KYC_STATUS } = require('../../shared/enums');
+const { logger } = require('../../shared/utils/logger');
+
+class AdminService {
+  // Get dashboard statistics
+  async getDashboardStatistics() {
+    const [
+      totalUsers,
+      totalDrivers,
+      activeDrivers,
+      totalDeliveries,
+      completedDeliveries,
+      totalDisputes,
+      openDisputes,
+      totalRevenue,
+      todayRevenue,
+      weeklyRevenue,
+      monthlyRevenue
+    ] = await Promise.all([
+      prisma.user.count({
+        where: {
+          isActive: true
+        }
+      }),
+      prisma.driver.count({
+        where: {
+          user: {
+            isActive: true
+          }
+        }
+      }),
+      prisma.driver.count({
+        where: {
+          user: {
+            isActive: true
+          },
+          isAvailable: true
+        }
+      }),
+      prisma.delivery.count(),
+      prisma.delivery.count({
         where: {
           status: ORDER_STATUS.COMPLETED
         }
@@ -708,8 +750,8 @@
       }
     });
 
+    // Update driver KYC status if no pending documents
     if (pendingDocuments === 0) {
-      // Update driver overall KYC status
       await prisma.driver.update({
         where: { id: driverId },
         data: {
@@ -718,7 +760,7 @@
       });
     }
 
-    logger.info(`KYC document approved: ${documentId} for driver: ${driverId} by admin: ${adminId}`);
+    logger.info(`KYC document approved: ${documentId} for driver: ${driverId}`);
 
     return updatedDocument;
   }
@@ -757,7 +799,7 @@
       }
     });
 
-    // Update driver overall KYC status
+    // Update driver KYC status to rejected
     await prisma.driver.update({
       where: { id: driverId },
       data: {
@@ -765,50 +807,40 @@
       }
     });
 
-    logger.info(`KYC document rejected: ${documentId} for driver: ${driverId} by admin: ${adminId}, reason: ${reason}`);
+    logger.info(`KYC document rejected: ${documentId} for driver: ${driverId}, reason: ${reason}`);
 
     return updatedDocument;
   }
 
   // Get system settings
   async getSystemSettings() {
-    // This would be implemented with a settings model
-    // For now, return mock data
+    // This would typically fetch from a settings table
+    // For now, return default settings
     return {
-      general: {
-        siteName: 'D-Ride',
-        siteDescription: 'Professional Delivery Service',
-        contactEmail: 'support@d-ride.com',
-        contactPhone: '+234-800-000-0000',
-        currency: 'NGN',
-        timezone: 'Africa/Lagos'
+      fareSettings: {
+        baseFare: 500,
+        perKmRate: 100,
+        perMinuteRate: 10,
+        minimumFare: 200
       },
-      payment: {
-        enableCashPayments: true,
-        enableCardPayments: true,
-        enableTransferPayments: true,
-        commissionRate: 0.2,
-        minimumFare: 500
+      commissionSettings: {
+        platformCommissionPercentage: 20,
+        driverCommissionPercentage: 80
       },
-      delivery: {
-        defaultRadius: 10,
-        maximumRadius: 50,
-        autoAssignTimeout: 30000,
-        cancellationTimeout: 1800000
-      },
-      notifications: {
-        enableEmailNotifications: true,
-        enableSmsNotifications: true,
-        enablePushNotifications: true
+      systemSettings: {
+        maxDeliveryDistance: 50,
+        defaultSearchRadius: 5,
+        driverTimeoutSeconds: 30
       }
     };
   }
 
   // Update system settings
   async updateSystemSettings(settings) {
-    // This would be implemented with a settings model
-    // For now, just return success
-    logger.info('System settings updated by admin');
+    // This would typically update a settings table
+    // For now, just log the update
+    logger.info('System settings updated by admin', settings);
+
     return { message: 'System settings updated successfully' };
   }
 
@@ -819,45 +851,72 @@
       limit = 50,
       level,
       startDate,
-      endDate,
-      search
+      endDate
     } = filters;
 
-    // This would be implemented with a logging system
+    // This would typically fetch from a logs table or file system
     // For now, return mock data
     return {
-      logs: [],
+      logs: [
+        {
+          id: '1',
+          level: 'info',
+          message: 'Server started successfully',
+          timestamp: new Date(),
+          metadata: {}
+        },
+        {
+          id: '2',
+          level: 'error',
+          message: 'Database connection failed',
+          timestamp: new Date(),
+          metadata: { error: 'Connection timeout' }
+        }
+      ],
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: 0,
-        pages: 0,
+        total: 2,
+        pages: 1,
         hasNext: false,
         hasPrev: false
       }
     };
   }
 
-  // Get analytics data
+  // Get analytics
   async getAnalytics(filters = {}) {
     const {
-      period = 'month',
       startDate,
       endDate,
-      type = 'revenue'
+      groupBy = 'day'
     } = filters;
 
-    // This would be implemented with comprehensive analytics
-    // For now, return mock data
+    // This would typically fetch from an analytics table or run complex queries
+    // For now, return mock analytics data
     return {
-      period,
-      type,
-      data: [],
-      summary: {
-        total: 0,
-        average: 0,
-        growth: 0
-      }
+      revenue: [
+        {
+          date: new Date(),
+          revenue: 15000,
+          orders: 45
+        }
+      ],
+      orders: [
+        {
+          date: new Date(),
+          total: 45,
+          completed: 42,
+          cancelled: 3
+        }
+      ],
+      drivers: [
+        {
+          date: new Date(),
+          active: 25,
+          online: 18
+        }
+      ]
     };
   }
 }

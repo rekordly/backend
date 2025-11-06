@@ -1,4 +1,537 @@
-    .map(delivery => {
+const { prisma } = require('../../config/database');
+const { AppError, NotFoundError } = require('../../shared/errors/app-error');
+const { ORDER_STATUS, DRIVER_STATUS, PAYMENT_STATUS } = require('../../shared/enums');
+const { calculateDistance, findNearestPoints } = require('../../shared/utils/geospatial');
+const { calculateFare } = require('./helpers/fare-calculator');
+const { matchDrivers } = require('./helpers/driver-matcher');
+const { updateDeliveryStatus } = require('./helpers/status-machine');
+const { REDIS_KEYS } = require('../../config/constants');
+const { logger } = require('../../shared/utils/logger');
+const driverService = require('../driver/driver.service');
+const notificationService = require('../notification/notification.service');
+
+class DeliveryService {
+  // Create delivery request
+  async createDelivery(userId, deliveryData) {
+    const {
+      pickupAddress,
+      deliveryAddress,
+      packageInfo,
+      deliveryType = 'STANDARD',
+      paymentMethod = 'CASH',
+      specialInstructions = '',
+      estimatedFare = null
+    } = deliveryData;
+
+    // Validate user
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user || !user.isActive) {
+      throw new NotFoundError('User not found');
+    }
+
+    // Calculate fare if not provided
+    const fare = estimatedFare || await calculateFare({
+      pickupAddress,
+      deliveryAddress,
+      deliveryType,
+      packageInfo
+    });
+
+    // Create delivery
+    const delivery = await prisma.delivery.create({
+      data: {
+        userId,
+        pickupAddress: {
+          create: pickupAddress
+        },
+        deliveryAddress: {
+          create: deliveryAddress
+        },
+        packageInfo: {
+          create: packageInfo
+        },
+        deliveryType,
+        paymentMethod,
+        specialInstructions,
+        estimatedFare: fare.totalFare,
+        distance: fare.distance,
+        estimatedDuration: fare.duration,
+        status: ORDER_STATUS.PENDING,
+        paymentStatus: 'PENDING'
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            phoneNumber: true
+          }
+        },
+        pickupAddress: true,
+        deliveryAddress: true,
+        packageInfo: true
+      }
+    });
+
+    // Find and match drivers
+    try {
+      const matchedDrivers = await matchDrivers(delivery);
+      
+      if (matchedDrivers.length > 0) {
+        // Update delivery with matched drivers
+        await prisma.delivery.update({
+          where: { id: delivery.id },
+          data: {
+            matchedDrivers: {
+              connect: matchedDrivers.map(driver => ({ id: driver.id }))
+            }
+          }
+        });
+
+        // Notify matched drivers
+        await notificationService.sendNotificationToDrivers(
+          matchedDrivers.map(d => d.userId),
+          {
+            type: 'NEW_DELIVERY_REQUEST',
+            title: 'New Delivery Request',
+            message: `New delivery request from ${delivery.user.fullName}`,
+            data: {
+              deliveryId: delivery.id,
+              pickupAddress: delivery.pickupAddress,
+              deliveryAddress: delivery.deliveryAddress,
+              estimatedFare: delivery.estimatedFare
+            }
+          }
+        );
+      }
+    } catch (error) {
+      logger.error(`Failed to match drivers for delivery ${delivery.id}:`, error);
+    }
+
+    logger.info(`Delivery created: ${delivery.id} by user: ${userId}`);
+
+    return delivery;
+  }
+
+  // Accept delivery by driver
+  async acceptDelivery(deliveryId, driverId) {
+    // Get delivery
+    const delivery = await prisma.delivery.findUnique({
+      where: { id: deliveryId },
+      include: {
+        user: true
+      }
+    });
+
+    if (!delivery) {
+      throw new NotFoundError('Delivery not found');
+    }
+
+    // Check if delivery can be accepted
+    if (delivery.status !== ORDER_STATUS.PENDING) {
+      throw new AppError('Delivery cannot be accepted', 400, 'INVALID_ORDER_STATUS');
+    }
+
+    // Check if driver is available
+    const driver = await prisma.driver.findUnique({
+      where: { id: driverId },
+      include: {
+        user: true
+      }
+    });
+
+    if (!driver || !driver.isAvailable || driver.status !== DRIVER_STATUS.ONLINE) {
+      throw new AppError('Driver not available', 400, 'DRIVER_UNAVAILABLE');
+    }
+
+    // Update delivery
+    const updatedDelivery = await prisma.delivery.update({
+      where: { id: deliveryId },
+      data: {
+        driverId,
+        status: ORDER_STATUS.ACCEPTED,
+        acceptedAt: new Date()
+      },
+      include: {
+        user: true,
+        driver: {
+          include: {
+            user: true
+          }
+        }
+      }
+    });
+
+    // Update driver status
+    await prisma.driver.update({
+      where: { id: driverId },
+      data: {
+        status: DRIVER_STATUS.BUSY,
+        isAvailable: false,
+        currentDeliveryId: deliveryId
+      }
+    });
+
+    // Notify user
+    await notificationService.sendNotificationToUser(
+      delivery.userId,
+      {
+        type: 'DELIVERY_ACCEPTED',
+        title: 'Driver Assigned',
+        message: `${driver.user.fullName} has accepted your delivery request`,
+        data: {
+          deliveryId: delivery.id,
+          driver: {
+            id: driver.id,
+            name: driver.user.fullName,
+            phone: driver.user.phoneNumber,
+            vehicle: driver.vehicle
+          }
+        }
+      }
+    );
+
+    logger.info(`Delivery ${deliveryId} accepted by driver ${driverId}`);
+
+    return updatedDelivery;
+  }
+
+  // Update delivery status
+  async updateDeliveryStatus(deliveryId, status, updateData = {}) {
+    const delivery = await prisma.delivery.findUnique({
+      where: { id: deliveryId },
+      include: {
+        user: true,
+        driver: {
+          include: {
+            user: true
+          }
+        }
+      }
+    });
+
+    if (!delivery) {
+      throw new NotFoundError('Delivery not found');
+    }
+
+    // Validate status transition
+    const validTransitions = {
+      [ORDER_STATUS.PENDING]: [ORDER_STATUS.ACCEPTED, ORDER_STATUS.CANCELLED],
+      [ORDER_STATUS.ACCEPTED]: [ORDER_STATUS.PICKUP_CONFIRMED, ORDER_STATUS.CANCELLED],
+      [ORDER_STATUS.PICKUP_CONFIRMED]: [ORDER_STATUS.IN_TRANSIT, ORDER_STATUS.CANCELLED],
+      [ORDER_STATUS.IN_TRANSIT]: [ORDER_STATUS.DELIVERED, ORDER_STATUS.CANCELLED],
+      [ORDER_STATUS.DELIVERED]: [ORDER_STATUS.COMPLETED],
+      [ORDER_STATUS.COMPLETED]: [],
+      [ORDER_STATUS.CANCELLED]: [],
+      [ORDER_STATUS.DISPUTED]: [ORDER_STATUS.RESOLVED, ORDER_STATUS.CANCELLED]
+    };
+
+    if (!validTransitions[delivery.status].includes(status)) {
+      throw new AppError(`Invalid status transition from ${delivery.status} to ${status}`, 400, 'INVALID_STATUS_TRANSITION');
+    }
+
+    // Build update data
+    const updateFields = {
+      status,
+      ...updateData
+    };
+
+    // Add timestamps based on status
+    switch (status) {
+      case ORDER_STATUS.PICKUP_CONFIRMED:
+        updateFields.pickupConfirmedAt = new Date();
+        break;
+      case ORDER_STATUS.IN_TRANSIT:
+        updateFields.inTransitAt = new Date();
+        break;
+      case ORDER_STATUS.DELIVERED:
+        updateFields.deliveredAt = new Date();
+        break;
+      case ORDER_STATUS.COMPLETED:
+        updateFields.completedAt = new Date();
+        updateFields.paymentStatus = 'PAID';
+        break;
+      case ORDER_STATUS.CANCELLED:
+        updateFields.cancelledAt = new Date();
+        break;
+    }
+
+    // Update delivery
+    const updatedDelivery = await prisma.delivery.update({
+      where: { id: deliveryId },
+      data: updateFields,
+      include: {
+        user: true,
+        driver: {
+          include: {
+            user: true
+          }
+        }
+      }
+    });
+
+    // Update driver status if completed
+    if (status === ORDER_STATUS.COMPLETED && delivery.driverId) {
+      await prisma.driver.update({
+        where: { id: delivery.driverId },
+        data: {
+          status: DRIVER_STATUS.ONLINE,
+          isAvailable: true,
+          currentDeliveryId: null,
+          completedCount: { increment: 1 },
+          totalEarnings: { increment: delivery.actualFare || delivery.estimatedFare }
+        }
+      });
+    }
+
+    // Send notifications
+    const notificationData = {
+      type: 'DELIVERY_STATUS_UPDATE',
+      title: 'Delivery Status Updated',
+      message: `Your delivery status is now ${status}`,
+      data: {
+        deliveryId: delivery.id,
+        status,
+        timestamp: new Date()
+      }
+    };
+
+    // Notify user
+    await notificationService.sendNotificationToUser(delivery.userId, notificationData);
+
+    // Notify driver if applicable
+    if (delivery.driverId) {
+      await notificationService.sendNotificationToUser(delivery.driver.userId, notificationData);
+    }
+
+    logger.info(`Delivery ${deliveryId} status updated to ${status}`);
+
+    return updatedDelivery;
+  }
+
+  // Get delivery by ID
+  async getDeliveryById(deliveryId, userId = null, driverId = null) {
+    const delivery = await prisma.delivery.findUnique({
+      where: { id: deliveryId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            phoneNumber: true,
+            profilePictureUrl: true
+          }
+        },
+        driver: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                fullName: true,
+                phoneNumber: true,
+                profilePictureUrl: true
+              }
+            },
+            vehicle: true
+          }
+        },
+        pickupAddress: true,
+        deliveryAddress: true,
+        packageInfo: true,
+        tracking: {
+          orderBy: {
+            timestamp: 'desc'
+          },
+          take: 50
+        }
+      }
+    });
+
+    if (!delivery) {
+      throw new NotFoundError('Delivery not found');
+    }
+
+    // Check permissions
+    if (userId && delivery.userId !== userId) {
+      throw new AppError('Unauthorized to access this delivery', 403, 'UNAUTHORIZED');
+    }
+
+    if (driverId && delivery.driverId !== driverId) {
+      throw new AppError('Unauthorized to access this delivery', 403, 'UNAUTHORIZED');
+    }
+
+    return delivery;
+  }
+
+  // Get user deliveries
+  async getUserDeliveries(userId, filters = {}) {
+    const {
+      page = 1,
+      limit = 10,
+      status,
+      startDate,
+      endDate
+    } = filters;
+
+    const skip = (page - 1) * limit;
+
+    // Build where clause
+    const where = {
+      userId,
+      ...(status && { status }),
+      ...(startDate && endDate && {
+        createdAt: {
+          gte: new Date(startDate),
+          lte: new Date(endDate)
+        }
+      })
+    };
+
+    // Get deliveries with pagination
+    const [deliveries, total] = await Promise.all([
+      prisma.delivery.findMany({
+        where,
+        include: {
+          driver: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  fullName: true,
+                  phoneNumber: true
+                }
+              },
+              vehicle: true
+            }
+          },
+          pickupAddress: true,
+          deliveryAddress: true
+        },
+        orderBy: {
+          createdAt: 'desc'
+        },
+        skip,
+        take: limit
+      }),
+      prisma.delivery.count({ where })
+    ]);
+
+    return {
+      deliveries,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / limit),
+        hasNext: page * limit < total,
+        hasPrev: page > 1
+      }
+    };
+  }
+
+  // Get driver deliveries
+  async getDriverDeliveries(driverId, filters = {}) {
+    const {
+      page = 1,
+      limit = 10,
+      status,
+      startDate,
+      endDate
+    } = filters;
+
+    const skip = (page - 1) * limit;
+
+    // Build where clause
+    const where = {
+      driverId,
+      ...(status && { status }),
+      ...(startDate && endDate && {
+        createdAt: {
+          gte: new Date(startDate),
+          lte: new Date(endDate)
+        }
+      })
+    };
+
+    // Get deliveries with pagination
+    const [deliveries, total] = await Promise.all([
+      prisma.delivery.findMany({
+        where,
+        include: {
+          user: {
+            select: {
+              id: true,
+              fullName: true,
+              phoneNumber: true
+            }
+          },
+          pickupAddress: true,
+          deliveryAddress: true
+        },
+        orderBy: {
+          createdAt: 'desc'
+        },
+        skip,
+        take: limit
+      }),
+      prisma.delivery.count({ where })
+    ]);
+
+    return {
+      deliveries,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / limit),
+        hasNext: page * limit < total,
+        hasPrev: page > 1
+      }
+    };
+  }
+
+  // Get nearby deliveries for driver
+  async getNearbyDeliveries(driverId, latitude, longitude, radius = 10, limit = 20) {
+    // Get driver
+    const driver = await prisma.driver.findUnique({
+      where: { id: driverId }
+    });
+
+    if (!driver || !driver.isAvailable || driver.status !== DRIVER_STATUS.ONLINE) {
+      throw new AppError('Driver not available', 400, 'DRIVER_UNAVAILABLE');
+    }
+
+    // Get pending deliveries within radius
+    const pendingDeliveries = await prisma.delivery.findMany({
+      where: {
+        status: ORDER_STATUS.PENDING,
+        driverId: null,
+        createdAt: {
+          gte: new Date(Date.now() - 30 * 60 * 1000) // Last 30 minutes
+        }
+      },
+      include: {
+        pickupAddress: true,
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            rating: true
+          }
+        }
+      },
+      orderBy: {
+        createdAt: 'desc'
+      },
+      take: 100
+    });
+
+    // Calculate distances and filter
+    const nearbyDeliveries = pendingDeliveries
+      .map(delivery => {
         const pickupLat = delivery.pickupAddress.latitude;
         const pickupLon = delivery.pickupAddress.longitude;
         const distance = calculateDistance(

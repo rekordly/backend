@@ -1,0 +1,8 @@
+const DRIVER_STATUS = {
+  OFFLINE: 'OFFLINE',
+  ONLINE: 'ONLINE',
+  BUSY: 'BUSY',
+  INACTIVE: 'INACTIVE'
+};
+
+module.exports = DRIVER_STATUS;

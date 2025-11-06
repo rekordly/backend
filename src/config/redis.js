@@ -18,10 +18,13 @@ async function connectRedis() {
     });
 
     await redisClient.connect();
+    logger.info('Redis connected successfully');
     return redisClient;
   } catch (error) {
     logger.error('Redis connection failed:', error);
-    throw error;
+    // Don't throw error, just return null so server can continue
+    logger.warn('Server will continue without Redis. Some features may not work properly.');
+    return null;
   }
 }
 
@@ -38,10 +41,8 @@ async function disconnectRedis() {
 }
 
 function getRedisClient() {
-  if (!redisClient) {
-    throw new Error('Redis client not initialized. Call connectRedis() first.');
-  }
-  return redisClient;
+  // Return null if Redis is not available
+  return redisClient || null;
 }
 
 module.exports = {
